@@ -39,12 +39,13 @@ This project implements a Threshold-Based OpenID Connect (OIDC) protocol that el
 
 ```
 ├── implementation/
-│   ├── chaincode/          # HLF chaincode (Go) — accountability & token logic
-│   └── client-sdk/         # Client SDK for OIDC flow
-├── protocol/               # Protocol design artifacts
-├── analysis/               # Security analysis scripts, ProVerif models
-├── evaluation/             # Performance benchmarks
-└── docs/                   # Technical documentation
+│   ├── dkg/                # DKG simulation (Feldman VSS, P-256)
+│   ├── signing/            # Threshold ECDSA signing + ES256 JWT
+│   ├── chaincode/          # Accountability Protocol chaincode (Go)
+│   ├── integration/        # End-to-end scenario tests
+│   └── benchmark/          # Performance benchmark suite
+├── evaluation/             # Benchmark results and analysis
+└── docs/                   # Technical documentation (not tracked in git)
 ```
 
 ## Protocol Flow
