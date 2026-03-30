@@ -52,9 +52,18 @@ type SigningResult struct {
 }
 
 // ThresholdSign produces an ES256-signed JWT using threshold signing simulation.
-// In production, this would use CGGMP21 MPC signing without key reconstruction.
-// For PoC, we simulate by reconstructing the key via Lagrange interpolation
-// from t shares, then signing with the reconstructed key.
+//
+// IMPORTANT LIMITATION: This PoC reconstructs the secret key via Lagrange
+// interpolation, which defeats the purpose of threshold signing in production.
+// A real implementation MUST use CGGMP21 MPC-based signing where the key is
+// NEVER reconstructed. This simulation demonstrates:
+//   - Correctness: any t-of-n share subset produces a valid ES256 signature
+//   - JWT compatibility: output is a standard JWT verifiable by any OIDC library
+//   - Feldman VSS: share verification against commitments works
+//
+// Benchmark results from this simulation measure only the cryptographic
+// computation cost, NOT the end-to-end latency of a distributed MPC protocol
+// (which would add network RTT, typically 100-500ms for real deployments).
 func ThresholdSign(dkgResult *dkg.DKGResult, signerIndices []int, payload *JWTPayload) (*SigningResult, error) {
 	start := time.Now()
 	curve := dkgResult.Params.Curve

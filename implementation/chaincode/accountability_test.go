@@ -160,6 +160,50 @@ func TestQueryMisbehaviorHistory(t *testing.T) {
 	}
 }
 
+func TestStrikeSystem_M2_GradualEscalation(t *testing.T) {
+	contract := newTestContract()
+
+	// M2 (Timeout): 10 strikes to disable
+	for i := 1; i <= 10; i++ {
+		evidence := makeEvidence(fmt.Sprintf("ev-timeout-%d", i), "P_5", M2Timeout, 2)
+		err := contract.RecordMisbehavior(evidence)
+		if err != nil {
+			t.Fatalf("M2 strike %d failed: %v", i, err)
+		}
+
+		status, _ := contract.GetPeerStatus("P_5")
+
+		switch {
+		case i < 6:
+			if status.Status != StatusWarning {
+				t.Errorf("strike %d: expected WARNING, got %s", i, status.Status)
+			}
+		case i < 10:
+			if status.Status != StatusProbation {
+				t.Errorf("strike %d: expected PROBATION, got %s", i, status.Status)
+			}
+		case i == 10:
+			if status.Status != StatusDisabled {
+				t.Errorf("strike %d: expected DISABLED, got %s", i, status.Status)
+			}
+		}
+	}
+}
+
+func TestDuplicateEvidenceID(t *testing.T) {
+	contract := newTestContract()
+
+	// Same evidence ID recorded twice — should both succeed (no dedup in PoC)
+	// but strike count should be 2
+	contract.RecordMisbehavior(makeEvidence("ev-dup", "P_3", M1InvalidSignature, 2))
+	contract.RecordMisbehavior(makeEvidence("ev-dup", "P_3", M1InvalidSignature, 2))
+
+	status, _ := contract.GetPeerStatus("P_3")
+	if status.StrikeCounts[string(M1InvalidSignature)] != 2 {
+		t.Errorf("expected 2 strikes, got %d", status.StrikeCounts[string(M1InvalidSignature)])
+	}
+}
+
 func TestCleanPeerStatus(t *testing.T) {
 	contract := newTestContract()
 
