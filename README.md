@@ -81,6 +81,34 @@ A novel 3-phase mechanism not found in existing threshold SSO schemes (VeriSSO, 
 | VeriSSO | 2025 | Yes | Yes | No | No | No |
 | **Ours** | **2026** | **Yes** | **Yes** | **Yes (HLF)** | **Yes** | **Yes** |
 
+## Running Tests
+
+```bash
+# All tests
+go test ./... -v
+
+# Race detector
+go test -race ./...
+
+# Benchmarks
+go test ./benchmark/ -bench=. -benchmem
+
+# Specific package
+go test ./signing/ -v -run TestVerifyJWTWithClaims
+```
+
+## Reproducing Benchmark Results
+
+```bash
+cd implementation
+go test ./benchmark/ -bench=. -benchmem -count=3
+```
+
+Results will show DKG/Signing/Accountability latency across
+(2,3), (3,5), (4,7), (5,9), (7,13) configurations.
+
+**Environment:** Go 1.22+, Linux, any x86_64 processor.
+
 ## License
 
-TBD
+MIT
