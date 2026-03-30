@@ -1,0 +1,58 @@
+# Paper (LaTeX — Overleaf'te yönetilecek)
+paper/
+
+# Claude Code workspace
+.claude/
+
+# Markdown files (makale notları, kararlar, analizler)
+*.md
+!README.md
+
+# Secrets & Keys
+*.pem
+*.key
+*.env
+.env
+.env.*
+crypto-config/
+
+# Go
+vendor/
+*.exe
+*.test
+*.out
+
+# Node.js
+node_modules/
+dist/
+*.tgz
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Build
+build/
+bin/
+
+# Evaluation raw data (large files)
+evaluation/results/*.csv
+evaluation/results/*.json
