@@ -190,17 +190,45 @@ func TestStrikeSystem_M2_GradualEscalation(t *testing.T) {
 	}
 }
 
-func TestDuplicateEvidenceID(t *testing.T) {
+func TestDuplicateEvidenceID_Rejected(t *testing.T) {
 	contract := newTestContract()
 
-	// Same evidence ID recorded twice — should both succeed (no dedup in PoC)
-	// but strike count should be 2
-	contract.RecordMisbehavior(makeEvidence("ev-dup", "P_3", M1InvalidSignature, 2))
-	contract.RecordMisbehavior(makeEvidence("ev-dup", "P_3", M1InvalidSignature, 2))
+	// First submission should succeed
+	err := contract.RecordMisbehavior(makeEvidence("ev-dup", "P_3", M1InvalidSignature, 2))
+	if err != nil {
+		t.Fatalf("first submission should succeed: %v", err)
+	}
 
+	// Same evidence ID again should be rejected (replay prevention)
+	err = contract.RecordMisbehavior(makeEvidence("ev-dup", "P_3", M1InvalidSignature, 2))
+	if err == nil {
+		t.Error("duplicate evidence ID should be rejected")
+	}
+
+	// Strike count should be 1 (not 2)
 	status, _ := contract.GetPeerStatus("P_3")
-	if status.StrikeCounts[string(M1InvalidSignature)] != 2 {
-		t.Errorf("expected 2 strikes, got %d", status.StrikeCounts[string(M1InvalidSignature)])
+	if status.StrikeCounts[string(M1InvalidSignature)] != 1 {
+		t.Errorf("expected 1 strike (dedup), got %d", status.StrikeCounts[string(M1InvalidSignature)])
+	}
+}
+
+func TestGetAllPeerStatuses(t *testing.T) {
+	contract := newTestContract()
+	contract.RecordMisbehavior(makeEvidence("ev-1", "P_1", M1InvalidSignature, 2))
+	contract.RecordMisbehavior(makeEvidence("ev-2", "P_3", M2Timeout, 2))
+
+	statuses, err := contract.GetAllPeerStatuses([]string{"P_1", "P_2", "P_3"})
+	if err != nil {
+		t.Fatalf("GetAllPeerStatuses failed: %v", err)
+	}
+	if len(statuses) != 3 {
+		t.Errorf("expected 3 statuses, got %d", len(statuses))
+	}
+	// P_1 should have WARNING, P_2 ACTIVE, P_3 WARNING
+	for _, s := range statuses {
+		if s.PeerID == "P_2" && s.Status != StatusActive {
+			t.Errorf("P_2 should be ACTIVE, got %s", s.Status)
+		}
 	}
 }
 

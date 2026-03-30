@@ -12,6 +12,7 @@ package chaincode
 import (
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -130,14 +131,20 @@ func (c *AccountabilityContract) RecordMisbehavior(evidenceJSON string) error {
 			c.MinWitnesses, len(evidence.Witnesses))
 	}
 
-	// 4. Store evidence on ledger
+	// 4. Check for duplicate evidence ID (prevent replay)
 	evidenceKey := fmt.Sprintf("MISBEHAVIOR_%s_%s", evidence.AccusedPeer, evidence.EvidenceID)
+	existing, _ := c.Store.GetState(evidenceKey)
+	if existing != nil {
+		return fmt.Errorf("evidence %s already recorded (replay rejected)", evidence.EvidenceID)
+	}
+
+	// 5. Store evidence on ledger
 	evidenceBytes, _ := json.Marshal(evidence)
 	if err := c.Store.PutState(evidenceKey, evidenceBytes); err != nil {
 		return fmt.Errorf("failed to store evidence: %w", err)
 	}
 
-	// 5. Update peer status
+	// 6. Update peer status
 	peerStatus, err := c.getOrCreatePeerStatus(evidence.AccusedPeer)
 	if err != nil {
 		return fmt.Errorf("failed to get peer status: %w", err)
@@ -148,7 +155,7 @@ func (c *AccountabilityContract) RecordMisbehavior(evidenceJSON string) error {
 	peerStatus.StrikeCounts[typeStr]++
 	peerStatus.History = append(peerStatus.History, evidence.EvidenceID)
 
-	// 6. Check sanction threshold
+	// 7. Check sanction threshold
 	threshold, exists := sanctionThresholds[evidence.Type]
 	if !exists {
 		threshold = 3 // default
@@ -196,6 +203,19 @@ func (c *AccountabilityContract) GetPeerStatus(peerID string) (*PeerStatus, erro
 	return c.getOrCreatePeerStatus(peerID)
 }
 
+// GetAllPeerStatuses returns status for all registered peers.
+func (c *AccountabilityContract) GetAllPeerStatuses(peerIDs []string) ([]PeerStatus, error) {
+	var statuses []PeerStatus
+	for _, id := range peerIDs {
+		status, err := c.getOrCreatePeerStatus(id)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get status for %s: %w", id, err)
+		}
+		statuses = append(statuses, *status)
+	}
+	return statuses, nil
+}
+
 func (c *AccountabilityContract) getOrCreatePeerStatus(peerID string) (*PeerStatus, error) {
 	key := fmt.Sprintf("PEER_STATUS_%s", peerID)
 	data, err := c.Store.GetState(key)
@@ -228,8 +248,9 @@ func (c *AccountabilityContract) savePeerStatus(status *PeerStatus) error {
 	return c.Store.PutState(key, data)
 }
 
-// MemoryStore is an in-memory LedgerStore for standalone testing.
+// MemoryStore is a thread-safe in-memory LedgerStore for testing.
 type MemoryStore struct {
+	mu   sync.RWMutex
 	data map[string][]byte
 }
 
@@ -239,10 +260,14 @@ func NewMemoryStore() *MemoryStore {
 }
 
 func (m *MemoryStore) PutState(key string, value []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.data[key] = value
 	return nil
 }
 
 func (m *MemoryStore) GetState(key string) ([]byte, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.data[key], nil
 }
