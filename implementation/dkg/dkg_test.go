@@ -98,3 +98,24 @@ func TestDKGDifferentParams(t *testing.T) {
 		})
 	}
 }
+
+func TestSimulateDKG_InvalidParams(t *testing.T) {
+	testCases := []struct {
+		name string
+		t, n int
+	}{
+		{"t-greater-than-n", 5, 3},
+		{"t-less-than-2", 1, 3},
+		{"t-equals-1", 1, 5},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			params := Params{T: tc.t, N: tc.n, Curve: elliptic.P256()}
+			_, err := SimulateDKG(params)
+			if err == nil {
+				t.Errorf("DKG should fail for t=%d, n=%d", tc.t, tc.n)
+			}
+		})
+	}
+}

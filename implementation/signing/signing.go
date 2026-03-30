@@ -77,6 +77,15 @@ func ThresholdSign(dkgResult *dkg.DKGResult, signerIndices []int, payload *JWTPa
 	// Use only t signers (first t from the provided indices)
 	activeSigners := signerIndices[:t]
 
+	// Check for duplicate signer indices (would cause ModInverse panic)
+	seen := make(map[int]bool)
+	for _, idx := range activeSigners {
+		if seen[idx] {
+			return nil, fmt.Errorf("duplicate signer index: %d", idx)
+		}
+		seen[idx] = true
+	}
+
 	// Collect shares for active signers
 	shares := make([]*dkg.Share, t)
 	for i, idx := range activeSigners {
@@ -109,8 +118,14 @@ func ThresholdSign(dkgResult *dkg.DKGResult, signerIndices []int, payload *JWTPa
 
 	// Build JWT
 	header := JWTHeader{Alg: "ES256", Typ: "JWT", Kid: "threshold-key-1"}
-	headerJSON, _ := json.Marshal(header)
-	payloadJSON, _ := json.Marshal(payload)
+	headerJSON, err := json.Marshal(header)
+	if err != nil {
+		return nil, fmt.Errorf("header marshal failed: %w", err)
+	}
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("payload marshal failed: %w", err)
+	}
 
 	headerB64 := base64URLEncode(headerJSON)
 	payloadB64 := base64URLEncode(payloadJSON)
@@ -170,6 +185,59 @@ func VerifyJWT(jwt string, publicKey *dkg.Commitment, curve elliptic.Curve) (boo
 
 	hash := sha256.Sum256([]byte(signingInput))
 	return ecdsa.Verify(pk, hash[:], r, s), nil
+}
+
+// ValidatePayload checks OIDC mandatory claims.
+func ValidatePayload(p *JWTPayload) error {
+	if p.Iss == "" {
+		return fmt.Errorf("iss (issuer) is required")
+	}
+	if p.Sub == "" {
+		return fmt.Errorf("sub (subject) is required")
+	}
+	if p.Aud == "" {
+		return fmt.Errorf("aud (audience) is required")
+	}
+	if p.Exp == 0 {
+		return fmt.Errorf("exp (expiration) is required")
+	}
+	if p.Exp <= time.Now().Unix() {
+		return fmt.Errorf("exp is in the past")
+	}
+	return nil
+}
+
+// VerifyJWTWithClaims verifies signature AND checks temporal claims.
+func VerifyJWTWithClaims(jwtStr string, expectedNonce string, publicKey *dkg.Commitment, curve elliptic.Curve) (bool, error) {
+	// 1. Verify signature
+	valid, err := VerifyJWT(jwtStr, publicKey, curve)
+	if err != nil || !valid {
+		return false, err
+	}
+
+	// 2. Decode payload and check claims
+	parts := strings.SplitN(jwtStr, ".", 3)
+	payloadBytes, err := base64URLDecode(parts[1])
+	if err != nil {
+		return false, fmt.Errorf("payload decode failed: %w", err)
+	}
+
+	var payload JWTPayload
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+		return false, fmt.Errorf("payload unmarshal failed: %w", err)
+	}
+
+	// Check expiration
+	if payload.Exp <= time.Now().Unix() {
+		return false, fmt.Errorf("token expired")
+	}
+
+	// Check nonce if provided
+	if expectedNonce != "" && payload.Nonce != expectedNonce {
+		return false, fmt.Errorf("nonce mismatch: expected %s, got %s", expectedNonce, payload.Nonce)
+	}
+
+	return true, nil
 }
 
 // lagrangeCoefficient computes the Lagrange basis polynomial at x=0
