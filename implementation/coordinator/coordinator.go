@@ -11,6 +11,7 @@
 package coordinator
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -20,6 +21,14 @@ import (
 	"github.com/sefatuncer/hyperledger-fabric-oidc-mfa/dkg"
 	"github.com/sefatuncer/hyperledger-fabric-oidc-mfa/signing"
 )
+
+// secureRandomHex generates a cryptographically secure random hex string.
+// Used for session IDs and authorization codes to prevent prediction attacks.
+func secureRandomHex(bytes int) string {
+	b := make([]byte, bytes)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
 
 // PeerSigningFunc represents the distributed signing process.
 // In production, this would collect partial signatures from t peers via
@@ -80,7 +89,7 @@ func (c *Coordinator) CreateSession(clientID, redirectURI, nonce, state string) 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	sessionID := fmt.Sprintf("sess-%d", time.Now().UnixNano())
+	sessionID := fmt.Sprintf("sess-%s", secureRandomHex(16))
 	c.sessions[sessionID] = &Session{
 		ID:          sessionID,
 		ClientID:    clientID,
@@ -117,7 +126,7 @@ func (c *Coordinator) RecordPeerApproval(sessionID, userID string) (bool, error)
 	session.ApprovalCount++
 	if session.ApprovalCount >= c.PublicInfo.Params.T {
 		session.Authenticated = true
-		session.AuthCode = fmt.Sprintf("code-%d", time.Now().UnixNano())
+		session.AuthCode = fmt.Sprintf("code-%s", secureRandomHex(16))
 		return true, nil
 	}
 	return false, nil

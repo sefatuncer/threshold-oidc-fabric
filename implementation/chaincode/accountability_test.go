@@ -186,14 +186,14 @@ func TestStrikeSystem_M1_DisableAt3(t *testing.T) {
 
 func TestStrikeSystem_M3_ImmediateDisable(t *testing.T) {
 	contract := newTestContract()
-	evidence := makeNonCryptoEvidence("ev-1", "P_2", M3Inconsistent, 2)
+	evidence := makeNonCryptoEvidence("ev-1", "P_5", M3Inconsistent, 2)
 
 	err := contract.RecordMisbehavior(evidence)
 	if err != nil {
 		t.Fatalf("RecordMisbehavior failed: %v", err)
 	}
 
-	status, _ := contract.GetPeerStatus("P_2")
+	status, _ := contract.GetPeerStatus("P_5")
 	if status.Status != StatusDisabled {
 		t.Errorf("M3 should immediately disable, got %s", status.Status)
 	}
@@ -201,9 +201,24 @@ func TestStrikeSystem_M3_ImmediateDisable(t *testing.T) {
 
 func TestStrikeSystem_M4_ImmediateDisable(t *testing.T) {
 	contract := newTestContract()
-	evidence := makeNonCryptoEvidence("ev-1", "P_4", M4Equivocation, 2)
-
-	err := contract.RecordMisbehavior(evidence)
+	// M4 requires two different equivocation values
+	ep := EvidencePackage{
+		EvidenceID: "ev-1", Type: M4Equivocation,
+		Timestamp: "2026-03-30T12:00:00Z", AccusedPeer: "P_4", SessionID: "s1",
+		Evidence: CryptoEvidence{
+			PeerIndex:   4,
+			Message:     "msg",
+			EquivValueA: "sigma_4_version_1",
+			EquivValueB: "sigma_4_version_2",
+			SessionRef:  "sess-equivoc",
+		},
+		Witnesses: []Witness{
+			{PeerID: "P_1", Attestation: "x", Signature: "s1"},
+			{PeerID: "P_2", Attestation: "x", Signature: "s2"},
+		},
+	}
+	data, _ := json.Marshal(ep)
+	err := contract.RecordMisbehavior(string(data))
 	if err != nil {
 		t.Fatalf("RecordMisbehavior failed: %v", err)
 	}
@@ -211,6 +226,50 @@ func TestStrikeSystem_M4_ImmediateDisable(t *testing.T) {
 	status, _ := contract.GetPeerStatus("P_4")
 	if status.Status != StatusDisabled {
 		t.Errorf("M4 should immediately disable, got %s", status.Status)
+	}
+}
+
+func TestM4_IdenticalValuesRejected(t *testing.T) {
+	contract := newTestContract()
+	ep := EvidencePackage{
+		EvidenceID: "ev-m4-same", Type: M4Equivocation,
+		AccusedPeer: "P_4", SessionID: "s1",
+		Evidence: CryptoEvidence{
+			PeerIndex:   4,
+			EquivValueA: "same_value",
+			EquivValueB: "same_value", // identical — not equivocation
+		},
+		Witnesses: []Witness{
+			{PeerID: "P_1", Attestation: "x", Signature: "s1"},
+			{PeerID: "P_2", Attestation: "x", Signature: "s2"},
+		},
+	}
+	data, _ := json.Marshal(ep)
+	err := contract.RecordMisbehavior(string(data))
+	if err == nil {
+		t.Error("should reject M4 with identical equivocation values")
+	}
+}
+
+func TestM4_MissingValuesRejected(t *testing.T) {
+	contract := newTestContract()
+	ep := EvidencePackage{
+		EvidenceID: "ev-m4-miss", Type: M4Equivocation,
+		AccusedPeer: "P_4", SessionID: "s1",
+		Evidence: CryptoEvidence{
+			PeerIndex:   4,
+			EquivValueA: "only_one_value",
+			// EquivValueB missing
+		},
+		Witnesses: []Witness{
+			{PeerID: "P_1", Attestation: "x", Signature: "s1"},
+			{PeerID: "P_2", Attestation: "x", Signature: "s2"},
+		},
+	}
+	data, _ := json.Marshal(ep)
+	err := contract.RecordMisbehavior(string(data))
+	if err == nil {
+		t.Error("should reject M4 with missing equivocation value")
 	}
 }
 
@@ -333,7 +392,6 @@ func TestVerifyShareFromEvidence_AllSharesValid(t *testing.T) {
 }
 
 func TestVerifyShareFromEvidence_TamperedShareInvalid(t *testing.T) {
-	// Verify that a tampered share fails Feldman VSS verification
 	dkgResult := testDKG(t)
 	curve := elliptic.P256()
 
@@ -344,5 +402,61 @@ func TestVerifyShareFromEvidence_TamperedShareInvalid(t *testing.T) {
 	valid := dkg.VerifyShare(tampered, dkgResult.Commitments, curve)
 	if valid {
 		t.Error("tampered share should fail verification")
+	}
+}
+
+// --- Witness Validation Tests ---
+
+func TestWitness_DuplicateRejected(t *testing.T) {
+	contract := newTestContract()
+	ep := EvidencePackage{
+		EvidenceID: "ev-dup-w", Type: M2Timeout,
+		AccusedPeer: "P_3", SessionID: "s1",
+		Evidence:    CryptoEvidence{PeerIndex: 3, Message: "msg"},
+		Witnesses: []Witness{
+			{PeerID: "P_1", Attestation: "x", Signature: "s1"},
+			{PeerID: "P_1", Attestation: "x", Signature: "s2"}, // duplicate
+		},
+	}
+	data, _ := json.Marshal(ep)
+	err := contract.RecordMisbehavior(string(data))
+	if err == nil {
+		t.Error("should reject duplicate witness")
+	}
+}
+
+func TestWitness_AccusedCannotSelfWitness(t *testing.T) {
+	contract := newTestContract()
+	ep := EvidencePackage{
+		EvidenceID: "ev-self-w", Type: M2Timeout,
+		AccusedPeer: "P_3", SessionID: "s1",
+		Evidence:    CryptoEvidence{PeerIndex: 3, Message: "msg"},
+		Witnesses: []Witness{
+			{PeerID: "P_1", Attestation: "x", Signature: "s1"},
+			{PeerID: "P_3", Attestation: "x", Signature: "s3"}, // accused = witness
+		},
+	}
+	data, _ := json.Marshal(ep)
+	err := contract.RecordMisbehavior(string(data))
+	if err == nil {
+		t.Error("accused peer should not be allowed as witness")
+	}
+}
+
+func TestWitness_EmptySignatureRejected(t *testing.T) {
+	contract := newTestContract()
+	ep := EvidencePackage{
+		EvidenceID: "ev-nosig", Type: M2Timeout,
+		AccusedPeer: "P_3", SessionID: "s1",
+		Evidence:    CryptoEvidence{PeerIndex: 3, Message: "msg"},
+		Witnesses: []Witness{
+			{PeerID: "P_1", Attestation: "x", Signature: "s1"},
+			{PeerID: "P_2", Attestation: "x", Signature: ""}, // empty sig
+		},
+	}
+	data, _ := json.Marshal(ep)
+	err := contract.RecordMisbehavior(string(data))
+	if err == nil {
+		t.Error("should reject witness with empty signature")
 	}
 }

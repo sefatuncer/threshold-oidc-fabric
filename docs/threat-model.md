@@ -261,3 +261,107 @@ Yarı-formal güvenlik analizi: her güvenlik hedefini (SG1-SG6) sistematik olar
 | T13 | Quantum adversary | ✗ | Scope dışı | P-256 ECDSA quantum-safe değil — future work |
 
 **Muhafazakâr iddia:** Sistemimiz 13 potansiyel tehditten 8'ini tam olarak karşılar (T1-T8), 2'sini kısmen hafifletir (T9-T10), ve 3'ünü scope dışı bırakır (T11-T13). Bu, mevcut en iyi threshold SSO şemalarından (PASTA, PESTO) anlamlı bir iyileştirmedir — özellikle T3 (accountability), T7 (evidence immutability) ve T8 (false accusation koruması) konularında benzersiz katkı sağlar.
+
+---
+
+## Formal Accountability Game Tanımı
+
+Aşağıdaki formalizm, Boneh & Komlo (FC 2024) "Threshold Signatures with Private Accountability" çalışmasındaki accountability game yapısından uyarlanmıştır. Amacımız, Accountability Protocol'ün iki temel güvenlik özelliğini — completeness ve soundness — game-based olarak tanımlamaktır.
+
+### Definition 1: Accountability Completeness
+
+**Gayri resmi ifade:** Dürüst bir peer asla yanlış suçlanamaz ve cezalandırılamaz.
+
+**Game G_Comp^A(λ):**
+
+1. Setup: Challenger (t,n)-DKG çalıştırır, her P_i'ye share sk_i ve tüm commitment'lar C = {C_0,...,C_{t-1}} verir.
+2. Adversary A, en fazla t-1 peer'ı corrupt eder.
+3. Signing oturumlarında, A corrupt peer'lar adına mesajlar gönderebilir.
+4. A, dürüst bir peer P_j hakkında bir evidence package E_j üretir ve RecordMisbehavior(E_j) çağrısı yapar.
+5. A kazanır ancak ve ancak: chaincode E_j'yi kabul eder (dürüst P_j hakkında misbehavior kaydı oluşturulur).
+
+**Theorem 1 (Completeness):** Feldman VSS'nin bağlayıcılığı (binding property) altında, herhangi bir PPT adversary A için:
+
+  Pr[G_Comp^A(λ) = 1] = negl(λ)
+
+**Kanıt taslağı (M1 için):**
+- Dürüst P_j'nin share'i sk_j, DKG sırasında doğru üretilmiştir.
+- Feldman VSS doğrulaması deterministic'tir: sk_j · G = Σ_{k=0}^{t-1} j^k · C_k
+- Bu eşitlik DKG sonrasında HER ZAMAN sağlanır (Feldman VSS'nin temel özelliği).
+- A'nın false evidence üretmesi için: ya (a) sk_j'yi değiştirmesi gerekir (P_j'nin private share'ine erişimi yok) ya da (b) commitment'ları değiştirmesi gerekir (ledger immutable — t-1 < t endorsement ile değiştirilemez).
+- Chaincode `verifyShareFromEvidence()` ile bağımsız doğrulama yapar → dürüst share kabul edilir → evidence reddedilir.
+- Ek koruma: t-1 witness gereksinimi — tek corrupt peer false accusation yapamaz.
+- Dolayısıyla Pr[G_Comp^A(λ) = 1] ≤ Pr[Feldman VSS kırılır] = negl(λ) (ECDLP varsayımı altında).
+
+### Definition 2: Accountability Soundness
+
+**Gayri resmi ifade:** Kötü niyetli bir peer'ın misbehavior'ı her zaman tespit edilir ve kanıtlanır.
+
+**Game G_Sound^A(λ):**
+
+1. Setup: Challenger (t,n)-DKG çalıştırır.
+2. Adversary A, en fazla t-1 peer'ı corrupt eder.
+3. Corrupt peer P_i bir signing oturumunda M1 misbehavior gerçekleştirir (geçersiz σ_i gönderir).
+4. Dürüst peer'lar Feldman VSS doğrulaması yaparak misbehavior tespit eder.
+5. A kazanır ancak ve ancak: misbehavior tespit EDİLEMEZ (hiçbir dürüst peer invalid σ_i'yi yakalayamaz).
+
+**Theorem 2 (Soundness):** Herhangi bir PPT adversary A için:
+
+  Pr[G_Sound^A(λ) = 1] = 0
+
+**Kanıt taslağı:**
+- Corrupt P_i geçersiz σ_i gönderirse, Feldman VSS doğrulaması σ_i · G ≠ Σ j^k · C_k sonucunu verir.
+- Bu kontrol deterministik ve hatasızdır — her dürüst peer aynı sonuca ulaşır.
+- Dolayısıyla tespit olasılığı 1'dir (false negative imkânsız).
+- CGGMP21'in identifiable abort özelliği bu sonucu destekler: protokol abort ederse, suçlu taraf identify edilir.
+- Sonuç: Pr[G_Sound^A(λ) = 1] = 0 (information-theoretic garanti, hesaplama varsayımı gerektirmez).
+
+### CGGMP21 Identifiable Abort ile İlişki
+
+Çalışmamızın Accountability Protocol'ü, CGGMP21'in identifiable abort'unun ÜZERİNE inşa edilmiştir:
+
+| Özellik | CGGMP21 Identifiable Abort | Bizim Accountability Protocol |
+|---------|---------------------------|------------------------------|
+| Tespit | Protokol abort → suçlu party identify | Aynı + Feldman VSS independent check |
+| Kanıt | Ephemeral (bellek içi) | Persistent (HLF ledger, immutable) |
+| Yaptırım | Yok (uygulama bırakılmış) | Otomatik (strike system → disable) |
+| Tarihçe | Yok | Tam denetim izi (QueryMisbehaviorHistory) |
+| False accusation koruması | Yok (trust-based) | t-1 witness + chaincode re-verification |
+
+---
+
+## M2 (Timeout) False Accusation Nicel Analizi
+
+M2 (timeout) misbehavior'ı için kriptografik doğrulama mümkün değildir — timeout bir operasyonel olaydır. Bu nedenle M2 false accusation riskinin nicel analizi kritiktir.
+
+### Saldırı Senaryosu
+
+t-1 malicious peer, koordineli olarak bir dürüst peer P_j'ye timeout iftirası atarak devre dışı bırakmaya çalışır.
+
+**Parametreler:** (3,5) konfigürasyonu, yani t=3, n=5, t-1=2 malicious peer.
+
+### Analiz
+
+1. **Her oturum başına:** 2 malicious peer, P_j hakkında timeout raporu gönderir. Ancak her rapor için t-1=2 witness gereklidir. Malicious peer'lar birbirlerine witness olabilir → her oturumda 1 false M2 kaydı oluşturulabilir.
+
+2. **Devre dışı bırakma eşiği:** M2 için 10 strike gereklidir.
+
+3. **Gerekli oturum sayısı:** 2 malicious peer, her oturumda 1 false M2 kaydı oluşturabilir → **10 oturum** gerekir.
+
+4. **Paralel saldırı:** Malicious peer'lar aynı anda birden fazla dürüst peer'a saldırabilir mi? Evet — ancak her bir hedef için ayrı 10 oturum gerekir. 3 dürüst peer'ı devre dışı bırakmak: 3 × 10 = **30 oturum**.
+
+5. **Operasyonel bağlam:** Her oturum bir gerçek kullanıcı authentication isteği gerektirir. Saldırganın 30 meşru oturum başlatması veya beklemesi gerekir — bu, gerçek dünya koşullarında önemli bir zaman penceresi ve fırsat maliyeti oluşturur.
+
+### Hafifletme Mekanizmaları
+
+| Mekanizma | Etki |
+|-----------|------|
+| Yüksek M2 eşiği (10) | 10 false timeout = 10 ayrı oturum gerekli |
+| t-1 witness gereksinimi | Tek malicious peer saldıramaz |
+| Monitoring / anomaly detection | Aynı peer'ların sürekli timeout raporları anormal pattern oluşturur |
+| Timeout süresi ayarlanabilirliği | T_sign artırılarak network jitter'dan kaynaklanan false positive azaltılabilir |
+| Dürüst peer'ların M2 counter izlemesi | Peer kendi M2 sayısını görebilir ve operatöre bildirebilir |
+
+### Sonuç
+
+(3,5) konfigürasyonunda, 2 malicious peer'ın 1 dürüst peer'ı M2 ile devre dışı bırakması **minimum 10 oturum** gerektirir. Bu, anlık bir saldırı değil, uzun süreli ve gözlemlenebilir bir kampanyadır. Tüm dürüst peer'ları devre dışı bırakmak (sistem tamamen çökertmek) ise t adet dürüst peer × 10 oturum = 30 oturum gerektirir — bu noktada sistem zaten t-1'den fazla arıza ile karşılaşmış olur ve SG6 (availability) garantisi devreye girer. M2 eşiğinin 10'dan daha yüksek tutulması (örn. 20) bu saldırı maliyetini ikiye katlar.
