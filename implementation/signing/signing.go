@@ -3,9 +3,15 @@
 // partial signatures can be combined into a valid ECDSA signature
 // verifiable by standard JWT libraries.
 //
-// NOTE: This uses Shamir's Secret Sharing for key reconstruction
-// simulation. A production system would use CGGMP21's MPC-based
-// signing (no key reconstruction).
+// NOTE: This PoC reconstructs the secret key via Lagrange interpolation to
+// produce a standard ECDSA signature. This is a SIMULATION — it demonstrates
+// correctness (any t-of-n subset yields a valid ES256 JWT) but does NOT
+// implement real MPC-based threshold signing. A production system would use
+// CGGMP21's MPC protocol (e.g., via tss-lib v2.0.2) where the secret key is
+// NEVER reconstructed. The benchmark results from this simulation measure only
+// local cryptographic computation cost (~50-110μs); real CGGMP21 MPC signing
+// would add 4+ interactive rounds of network communication, typically resulting
+// in 100-500ms end-to-end latency depending on network topology.
 package signing
 
 import (

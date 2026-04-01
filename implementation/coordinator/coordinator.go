@@ -2,9 +2,17 @@
 // stateless flow manager that orchestrates authentication and signing
 // without holding any key material. This demonstrates the separation
 // of concerns: the Coordinator CANNOT forge tokens.
+//
+// SECURITY PROPERTY: The Coordinator stores only PublicDKGInfo (public key +
+// commitments). It has NO access to secret key shares. Token production
+// is delegated to a PeerSigningFunc callback that represents the distributed
+// peer signing process. The Coordinator builds the JWT payload and passes it
+// to the peers for threshold signing — it cannot sign itself.
 package coordinator
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"sync"
 	"time"
@@ -13,35 +21,56 @@ import (
 	"github.com/sefatuncer/hyperledger-fabric-oidc-mfa/signing"
 )
 
+// PeerSigningFunc represents the distributed signing process.
+// In production, this would collect partial signatures from t peers via
+// network calls and aggregate them. The Coordinator invokes this callback
+// but has no access to key shares — signing happens peer-side.
+type PeerSigningFunc func(payload *signing.JWTPayload, signerIndices []int) (*signing.SigningResult, error)
+
 // Coordinator manages OIDC sessions and signing orchestration.
-// IMPORTANT: It holds NO key shares and CANNOT produce valid signatures.
+// SECURITY: It holds only PublicDKGInfo (pk + commitments) — NO key shares.
+// It CANNOT produce valid signatures without the PeerSigningFunc callback.
 type Coordinator struct {
-	// No sk, sk_i, or any key material fields — by design
-	DKGResult *dkg.DKGResult // Public info only (pk, commitments)
+	// PublicInfo contains only the joint public key and Feldman commitments.
+	// NO secret key shares — this is a strict security boundary.
+	PublicInfo *dkg.PublicDKGInfo
 	Issuer    string
+	SignFunc  PeerSigningFunc // Callback to peers for threshold signing
 	sessions  map[string]*Session
 	mu        sync.RWMutex
 }
 
 // Session tracks an in-progress authentication flow.
 type Session struct {
-	ID           string
-	ClientID     string
-	RedirectURI  string
-	Nonce        string
-	State        string
-	CreatedAt    time.Time
+	ID            string
+	ClientID      string
+	RedirectURI   string
+	Nonce         string
+	State         string
+	UserID        string // Authenticated user identity
+	CreatedAt     time.Time
 	Authenticated bool
 	ApprovalCount int
-	AuthCode     string
-	JWT          string
+	BindingHash   string // H(user_id || session_id || nonce) — payload binding
+	AuthCode      string
+	JWT           string
 }
 
-// New creates a Coordinator with public DKG information.
-func New(dkgResult *dkg.DKGResult, issuer string) *Coordinator {
+// ComputeBindingHash computes H(user_id || session_id || nonce) for
+// payload binding. Peers include this hash in their MFA attestations
+// and verify it before signing, preventing Coordinator payload manipulation.
+func ComputeBindingHash(userID, sessionID, nonce string) string {
+	h := sha256.Sum256([]byte(userID + "||" + sessionID + "||" + nonce))
+	return hex.EncodeToString(h[:])
+}
+
+// New creates a Coordinator with ONLY public DKG information and a peer
+// signing callback. The Coordinator never receives secret key shares.
+func New(publicInfo *dkg.PublicDKGInfo, issuer string, signFunc PeerSigningFunc) *Coordinator {
 	return &Coordinator{
-		DKGResult: dkgResult,
+		PublicInfo: publicInfo,
 		Issuer:    issuer,
+		SignFunc:  signFunc,
 		sessions:  make(map[string]*Session),
 	}
 }
@@ -63,9 +92,10 @@ func (c *Coordinator) CreateSession(clientID, redirectURI, nonce, state string) 
 	return sessionID
 }
 
-// RecordPeerApproval records that a peer has approved authentication.
-// Returns true if the threshold t is reached.
-func (c *Coordinator) RecordPeerApproval(sessionID string) (bool, error) {
+// RecordPeerApproval records that a peer has approved authentication
+// for a given userID. The first approval sets the binding hash;
+// subsequent approvals must match. Returns true if threshold t is reached.
+func (c *Coordinator) RecordPeerApproval(sessionID, userID string) (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -74,8 +104,18 @@ func (c *Coordinator) RecordPeerApproval(sessionID string) (bool, error) {
 		return false, fmt.Errorf("session not found: %s", sessionID)
 	}
 
+	bindingHash := ComputeBindingHash(userID, sessionID, session.Nonce)
+
+	// First approval sets the binding; subsequent must match
+	if session.BindingHash == "" {
+		session.BindingHash = bindingHash
+		session.UserID = userID
+	} else if session.BindingHash != bindingHash {
+		return false, fmt.Errorf("binding hash mismatch: peer authenticated different user")
+	}
+
 	session.ApprovalCount++
-	if session.ApprovalCount >= c.DKGResult.Params.T {
+	if session.ApprovalCount >= c.PublicInfo.Params.T {
 		session.Authenticated = true
 		session.AuthCode = fmt.Sprintf("code-%d", time.Now().UnixNano())
 		return true, nil
@@ -84,7 +124,8 @@ func (c *Coordinator) RecordPeerApproval(sessionID string) (bool, error) {
 }
 
 // ProduceToken orchestrates threshold signing for an authenticated session.
-// The Coordinator collects partial signatures but CANNOT sign itself.
+// The Coordinator builds the JWT payload and delegates signing to the peers
+// via SignFunc. It CANNOT sign itself — it has no key material.
 func (c *Coordinator) ProduceToken(sessionID string, signerIndices []int) (*signing.SigningResult, error) {
 	c.mu.RLock()
 	session, ok := c.sessions[sessionID]
@@ -97,21 +138,32 @@ func (c *Coordinator) ProduceToken(sessionID string, signerIndices []int) (*sign
 		return nil, fmt.Errorf("session not authenticated")
 	}
 
+	// Payload binding: sub must match the authenticated user
+	sub := session.UserID
+	expectedHash := ComputeBindingHash(sub, sessionID, session.Nonce)
+	if expectedHash != session.BindingHash {
+		return nil, fmt.Errorf("payload binding failed: sub does not match authenticated user")
+	}
+
 	payload := &signing.JWTPayload{
 		Iss:            c.Issuer,
-		Sub:            "user-" + session.ClientID,
+		Sub:            sub,
 		Aud:            session.ClientID,
 		Exp:            time.Now().Add(1 * time.Hour).Unix(),
 		Iat:            time.Now().Unix(),
 		Nonce:          session.Nonce,
 		AuthTime:       session.CreatedAt.Unix(),
 		Amr:            []string{"pwd", "otp"},
-		ThresholdPeers: c.DKGResult.Params.T,
+		ThresholdPeers: c.PublicInfo.Params.T,
 	}
 
-	result, err := signing.ThresholdSign(c.DKGResult, signerIndices, payload)
+	// Delegate signing to peers — Coordinator has no key shares
+	if c.SignFunc == nil {
+		return nil, fmt.Errorf("no peer signing function configured")
+	}
+	result, err := c.SignFunc(payload, signerIndices)
 	if err != nil {
-		return nil, fmt.Errorf("signing failed: %w", err)
+		return nil, fmt.Errorf("peer signing failed: %w", err)
 	}
 
 	c.mu.Lock()
@@ -135,7 +187,8 @@ func (c *Coordinator) ExchangeCode(authCode string) (string, error) {
 }
 
 // HasKeyMaterial returns false — the Coordinator NEVER holds key material.
-// This method exists solely to demonstrate the security property.
+// This is enforced by type system: PublicDKGInfo contains no Share fields.
 func (c *Coordinator) HasKeyMaterial() bool {
+	// PublicDKGInfo type does not contain Shares — enforced at compile time.
 	return false
 }

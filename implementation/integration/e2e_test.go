@@ -7,6 +7,7 @@ package integration
 
 import (
 	"crypto/elliptic"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math/big"
@@ -115,7 +116,8 @@ func TestScenario2_MisbehaviorFlow(t *testing.T) {
 	}
 	t.Log("Step 1: Honest P3 share verified OK — zero false positives confirmed")
 
-	// Step 2: Evidence generation
+	// Step 2: Evidence generation with real cryptographic data
+	// The chaincode will independently re-verify the share against commitments.
 	evidence := chaincode.EvidencePackage{
 		EvidenceID:  "ev-e2e-001",
 		Type:        chaincode.M1InvalidSignature,
@@ -123,11 +125,10 @@ func TestScenario2_MisbehaviorFlow(t *testing.T) {
 		AccusedPeer: "P_3",
 		SessionID:   "sess-e2e-001",
 		Evidence: chaincode.CryptoEvidence{
-			InvalidPartialSig:   tamperedShare.Value.Text(16),
-			ExpectedCommitments: commitmentStrings(dkgResult.Commitments),
+			ShareValueHex:       hex.EncodeToString(tamperedShare.Value.Bytes()),
+			CommitmentPointsHex: commitmentPointsHex(dkgResult.Commitments),
 			Message:             "jwt-signing-input-e2e",
 			PeerIndex:           3,
-			VerificationResult:  false,
 		},
 		Witnesses: []chaincode.Witness{
 			{PeerID: "P_1", Attestation: "Verified σ_3 failed against commitments", Signature: "sig_P1"},
@@ -294,6 +295,17 @@ func BenchmarkSigning_Configurations(b *testing.B) {
 }
 
 func BenchmarkAccountability_RecordMisbehavior(b *testing.B) {
+	// Use real DKG result for cryptographic re-verification benchmark
+	params := dkg.DefaultParams()
+	dkgResult, err := dkg.SimulateDKG(params)
+	if err != nil {
+		b.Fatalf("DKG failed: %v", err)
+	}
+
+	// Tamper share to create valid M1 evidence
+	tamperedValue := new(big.Int).Add(dkgResult.Shares[2].Value, big.NewInt(42))
+	tamperedValue.Mod(tamperedValue, params.Curve.Params().N)
+
 	evidence := chaincode.EvidencePackage{
 		EvidenceID:  "ev-bench",
 		Type:        chaincode.M1InvalidSignature,
@@ -301,7 +313,10 @@ func BenchmarkAccountability_RecordMisbehavior(b *testing.B) {
 		AccusedPeer: "P_3",
 		SessionID:   "sess-bench",
 		Evidence: chaincode.CryptoEvidence{
-			VerificationResult: false,
+			ShareValueHex:       hex.EncodeToString(tamperedValue.Bytes()),
+			CommitmentPointsHex: commitmentPointsHex(dkgResult.Commitments),
+			Message:             "jwt-signing-input",
+			PeerIndex:           3,
 		},
 		Witnesses: []chaincode.Witness{
 			{PeerID: "P_1", Signature: "sig1"},
@@ -318,11 +333,14 @@ func BenchmarkAccountability_RecordMisbehavior(b *testing.B) {
 	}
 }
 
-// helper
-func commitmentStrings(comms []dkg.Commitment) []string {
-	result := make([]string, len(comms))
+// commitmentPointsHex converts DKG commitments to hex-encoded pairs for CryptoEvidence.
+func commitmentPointsHex(comms []dkg.Commitment) [][2]string {
+	result := make([][2]string, len(comms))
 	for i, c := range comms {
-		result[i] = fmt.Sprintf("(%s,%s)", c.X.Text(16)[:8], c.Y.Text(16)[:8])
+		result[i] = [2]string{
+			hex.EncodeToString(c.X.Bytes()),
+			hex.EncodeToString(c.Y.Bytes()),
+		}
 	}
 	return result
 }

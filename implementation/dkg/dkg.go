@@ -2,8 +2,11 @@
 // simulation for threshold ECDSA on P-256. This is a PoC-level implementation
 // demonstrating the Feldman VSS-based DKG protocol described in the paper.
 //
-// NOTE: This is NOT production-grade. A production system would use tss-lib
-// (BNB Chain) or a similar audited library implementing CGGMP21.
+// NOTE: This is a PoC-level simulation, NOT a production MPC implementation.
+// A production system would integrate tss-lib (BNB Chain, v2.0.2) or a similar
+// audited library implementing the full CGGMP21 MPC protocol. The current PoC
+// uses Go's standard crypto library to simulate DKG locally — it does NOT
+// perform distributed multi-party computation across network nodes.
 package dkg
 
 import (
@@ -31,12 +34,34 @@ type Commitment struct {
 	X, Y *big.Int
 }
 
-// DKGResult contains the output of the DKG protocol.
+// DKGResult contains the full output of the DKG protocol, including
+// secret shares. This must ONLY be stored by the peers themselves,
+// never by the Coordinator or any non-signing component.
 type DKGResult struct {
 	PublicKey    *Commitment  // Joint public key (pk = sk * G)
-	Shares      []*Share     // Each peer's secret share
+	Shares      []*Share     // Each peer's secret share (PRIVATE — peer-only)
 	Commitments []Commitment // Feldman VSS commitments (public)
 	Params      Params
+}
+
+// PublicDKGInfo contains only the public outputs of the DKG protocol.
+// This is what the Coordinator and Relying Parties receive — it contains
+// NO secret key shares. The Coordinator uses this to verify parameters
+// and build JWT payloads, but CANNOT sign tokens.
+type PublicDKGInfo struct {
+	PublicKey    *Commitment  // Joint public key (pk = sk * G)
+	Commitments []Commitment // Feldman VSS commitments (public)
+	Params      Params
+}
+
+// PublicInfo extracts only the public information from a DKGResult.
+// The returned struct contains no secret key material.
+func (r *DKGResult) PublicInfo() *PublicDKGInfo {
+	return &PublicDKGInfo{
+		PublicKey:    r.PublicKey,
+		Commitments: r.Commitments,
+		Params:      r.Params,
+	}
 }
 
 // DefaultParams returns (t=3, n=5) on P-256.

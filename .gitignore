@@ -7,6 +7,8 @@ paper/
 # Markdown files (makale notları, kararlar, analizler)
 *.md
 !README.md
+!docs/**/*.md
+!evaluation/**/*.md
 
 # Secrets & Keys
 *.pem

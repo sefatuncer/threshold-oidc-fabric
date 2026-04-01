@@ -10,10 +10,15 @@
 package chaincode
 
 import (
+	"crypto/elliptic"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"sync"
 	"time"
+
+	"github.com/sefatuncer/hyperledger-fabric-oidc-mfa/dkg"
 )
 
 // MisbehaviorType categorizes peer misbehavior.
@@ -56,12 +61,19 @@ type EvidencePackage struct {
 }
 
 // CryptoEvidence holds the cryptographic proof data.
+// For M1 (invalid partial signature), the chaincode performs independent
+// Feldman VSS re-verification rather than trusting the reporter's boolean flag.
 type CryptoEvidence struct {
-	InvalidPartialSig   string   `json:"invalidPartialSignature"`
-	ExpectedCommitments []string `json:"expectedCommitments"`
-	Message             string   `json:"message"`
-	PeerIndex           int      `json:"peerIndex"`
-	VerificationResult  bool     `json:"verificationResult"`
+	// ShareValueHex is the accused peer's claimed share value (hex-encoded big.Int).
+	// The chaincode re-verifies this against commitments using dkg.VerifyShare.
+	ShareValueHex string `json:"shareValueHex"`
+	// CommitmentPointsHex stores Feldman VSS commitment points as hex-encoded
+	// pairs [x_hex, y_hex] for each commitment on P-256.
+	CommitmentPointsHex [][2]string `json:"commitmentPointsHex"`
+	// Message is the JWT signing input that was being signed.
+	Message   string `json:"message"`
+	// PeerIndex is the 1-based index of the accused peer.
+	PeerIndex int    `json:"peerIndex"`
 }
 
 // Witness represents a peer attestation.
@@ -118,12 +130,39 @@ func (c *AccountabilityContract) RecordMisbehavior(evidenceJSON string) error {
 		return fmt.Errorf("evidence must have a type")
 	}
 
-	// 2. For M1, verify that the partial signature is actually invalid
+	// 2. For M1, perform independent Feldman VSS re-verification.
+	// The chaincode does NOT trust the reporter's claim — it re-verifies
+	// the accused peer's share against the Feldman commitments on-chain.
 	if evidence.Type == M1InvalidSignature {
-		if evidence.Evidence.VerificationResult {
-			return fmt.Errorf("evidence invalid: partial signature is actually valid")
+		shareValid, err := c.verifyShareFromEvidence(&evidence.Evidence)
+		if err != nil {
+			return fmt.Errorf("cryptographic re-verification failed: %w", err)
 		}
+		if shareValid {
+			// The share is actually valid — this is a false accusation.
+			return fmt.Errorf("evidence rejected: Feldman VSS re-verification shows share is valid (false accusation)")
+		}
+		// Share is genuinely invalid → misbehavior confirmed cryptographically.
 	}
+
+	// For M2 (Timeout): No cryptographic re-verification possible — timeout is
+	// an operational event, not a cryptographic one. Protection relies on the
+	// high sanction threshold (10 strikes) and t-1 witness requirement.
+	//
+	// For M3 (Inconsistent Share): Verification requires cross-session commitment
+	// comparison. The chaincode checks that the commitment stored in this evidence
+	// differs from a previously recorded commitment for the same peer — this is a
+	// ledger lookup, not a Feldman VSS check. Implemented via witness attestations.
+	//
+	// For M4 (Equivocation): Verification requires two different σ_i values signed
+	// by the same peer for the same session. The evidence must contain both values
+	// and peer signatures proving authenticity. Implemented via witness attestations
+	// carrying the conflicting signatures.
+	//
+	// In all cases, the t-1 witness requirement provides Byzantine fault tolerance
+	// against false accusations. Only M1 benefits from on-chain Feldman VSS
+	// re-verification because it involves a single share-commitment pair that can
+	// be independently checked.
 
 	// 3. Check minimum witness count
 	if len(evidence.Witnesses) < c.MinWitnesses {
@@ -214,6 +253,58 @@ func (c *AccountabilityContract) GetAllPeerStatuses(peerIDs []string) ([]PeerSta
 		statuses = append(statuses, *status)
 	}
 	return statuses, nil
+}
+
+// verifyShareFromEvidence performs independent Feldman VSS re-verification
+// of the accused peer's share against the public commitments. This is the
+// core cryptographic guarantee of the Accountability Protocol: the chaincode
+// itself verifies the evidence rather than trusting the reporter's claim.
+//
+// Returns (true, nil) if the share IS valid (false accusation).
+// Returns (false, nil) if the share IS invalid (confirmed misbehavior).
+func (c *AccountabilityContract) verifyShareFromEvidence(ev *CryptoEvidence) (bool, error) {
+	if ev.ShareValueHex == "" {
+		return false, fmt.Errorf("shareValueHex is required for M1 evidence")
+	}
+	if len(ev.CommitmentPointsHex) == 0 {
+		return false, fmt.Errorf("commitmentPointsHex is required for M1 evidence")
+	}
+	if ev.PeerIndex < 1 {
+		return false, fmt.Errorf("peerIndex must be >= 1")
+	}
+
+	// Parse the share value from hex
+	shareBytes, err := hex.DecodeString(ev.ShareValueHex)
+	if err != nil {
+		return false, fmt.Errorf("invalid shareValueHex: %w", err)
+	}
+	shareValue := new(big.Int).SetBytes(shareBytes)
+
+	// Parse commitment points from hex
+	curve := elliptic.P256()
+	commitments := make([]dkg.Commitment, len(ev.CommitmentPointsHex))
+	for i, pair := range ev.CommitmentPointsHex {
+		xBytes, err := hex.DecodeString(pair[0])
+		if err != nil {
+			return false, fmt.Errorf("invalid commitment[%d].x hex: %w", i, err)
+		}
+		yBytes, err := hex.DecodeString(pair[1])
+		if err != nil {
+			return false, fmt.Errorf("invalid commitment[%d].y hex: %w", i, err)
+		}
+		commitments[i] = dkg.Commitment{
+			X: new(big.Int).SetBytes(xBytes),
+			Y: new(big.Int).SetBytes(yBytes),
+		}
+	}
+
+	// Perform Feldman VSS verification using the same function
+	// used during DKG — deterministic and cryptographically sound.
+	share := &dkg.Share{
+		Index: ev.PeerIndex,
+		Value: shareValue,
+	}
+	return dkg.VerifyShare(share, commitments, curve), nil
 }
 
 func (c *AccountabilityContract) getOrCreatePeerStatus(peerID string) (*PeerStatus, error) {

@@ -14,9 +14,11 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/big"
 	"sort"
 	"testing"
 	"time"
@@ -26,11 +28,16 @@ import (
 	"github.com/sefatuncer/hyperledger-fabric-oidc-mfa/signing"
 )
 
-const iterations = 500
+const (
+	iterations     = 500
+	warmUpCount    = 50 // warm-up iterations discarded before measurement
+	confidenceZ95  = 1.96
+)
 
-// stats computes min, max, mean, stddev, p50, p99 from durations.
+// stats computes min, max, mean, stddev, p50, p99, and 95% CI from durations.
 type stats struct {
 	Min, Max, Mean, StdDev, P50, P99 time.Duration
+	CI95Lower, CI95Upper             time.Duration // 95% confidence interval
 	Count                            int
 }
 
@@ -51,22 +58,37 @@ func computeStats(durations []time.Duration) stats {
 		diff := float64(d) - mean
 		variance += diff * diff
 	}
-	variance /= float64(len(durations))
+	variance /= float64(len(durations) - 1) // Bessel's correction (sample variance)
+	stddev := math.Sqrt(variance)
+
+	// 95% confidence interval: mean ± z * (stddev / sqrt(n))
+	sem := stddev / math.Sqrt(float64(len(durations))) // standard error of mean
+	ci95Margin := confidenceZ95 * sem
 
 	return stats{
-		Min:    durations[0],
-		Max:    durations[len(durations)-1],
-		Mean:   time.Duration(mean),
-		StdDev: time.Duration(math.Sqrt(variance)),
-		P50:    durations[len(durations)/2],
-		P99:    durations[int(float64(len(durations))*0.99)],
-		Count:  len(durations),
+		Min:       durations[0],
+		Max:       durations[len(durations)-1],
+		Mean:      time.Duration(mean),
+		StdDev:    time.Duration(stddev),
+		P50:       durations[len(durations)/2],
+		P99:       durations[int(float64(len(durations))*0.99)],
+		CI95Lower: time.Duration(mean - ci95Margin),
+		CI95Upper: time.Duration(mean + ci95Margin),
+		Count:     len(durations),
 	}
 }
 
 func (s stats) String() string {
-	return fmt.Sprintf("n=%d mean=%v min=%v max=%v p50=%v p99=%v stddev=%v",
-		s.Count, s.Mean, s.Min, s.Max, s.P50, s.P99, s.StdDev)
+	return fmt.Sprintf("n=%d mean=%v [95%%CI: %v-%v] min=%v p50=%v p99=%v stddev=%v",
+		s.Count, s.Mean, s.CI95Lower, s.CI95Upper, s.Min, s.P50, s.P99, s.StdDev)
+}
+
+// runWarmUp executes warm-up iterations that are discarded before measurement.
+// This ensures JIT compilation, CPU cache warming, and Go runtime stabilization.
+func runWarmUp(f func()) {
+	for i := 0; i < warmUpCount; i++ {
+		f()
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -83,8 +105,11 @@ func TestBenchmark_DKG_Latency(t *testing.T) {
 
 	for _, cfg := range configs {
 		params := dkg.Params{T: cfg.t, N: cfg.n, Curve: elliptic.P256()}
-		durations := make([]time.Duration, iterations)
 
+		// Warm-up: discard first iterations to stabilize CPU cache and runtime
+		runWarmUp(func() { dkg.SimulateDKG(params) })
+
+		durations := make([]time.Duration, iterations)
 		for i := 0; i < iterations; i++ {
 			start := time.Now()
 			dkg.SimulateDKG(params)
@@ -113,6 +138,14 @@ func TestBenchmark_Signing_ThresholdVsBaseline(t *testing.T) {
 
 	// Baseline: standard single-key ECDSA signing
 	privateKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+
+	// Warm-up baseline
+	runWarmUp(func() {
+		msg := []byte("eyJhbGciOiJFUzI1NiJ9.eyJpc3MiOiJ0ZXN0In0")
+		hash := sha256.Sum256(msg)
+		ecdsa.Sign(rand.Reader, privateKey, hash[:])
+	})
+
 	baselineDurations := make([]time.Duration, iterations)
 	for i := 0; i < iterations; i++ {
 		start := time.Now()
@@ -139,6 +172,9 @@ func TestBenchmark_Signing_ThresholdVsBaseline(t *testing.T) {
 	for _, cfg := range configs {
 		params := dkg.Params{T: cfg.t, N: cfg.n, Curve: elliptic.P256()}
 		dkgResult, _ := dkg.SimulateDKG(params)
+
+		// Warm-up threshold signing
+		runWarmUp(func() { signing.ThresholdSign(dkgResult, cfg.signers, payload) })
 
 		durations := make([]time.Duration, iterations)
 		for i := 0; i < iterations; i++ {
@@ -167,6 +203,12 @@ func TestBenchmark_Accountability_Overhead(t *testing.T) {
 		Exp: time.Now().Add(1 * time.Hour).Unix(),
 		Iat: time.Now().Unix(),
 	}
+
+	// Warm-up: stabilize CPU cache and Go runtime
+	runWarmUp(func() {
+		result, _ := signing.ThresholdSign(dkgResult, []int{1, 2, 3}, payload)
+		signing.VerifyJWT(result.JWT, dkgResult.PublicKey, params.Curve)
+	})
 
 	// Normal flow: DKG already done, sign + verify only
 	normalDurations := make([]time.Duration, iterations)
@@ -205,13 +247,24 @@ func TestBenchmark_Accountability_Overhead(t *testing.T) {
 			dkg.VerifyShare(share, dkgResult.Commitments, params.Curve)
 		}
 
-		// Record misbehavior
+		// Record misbehavior with real Feldman VSS re-verification
 		store := chaincode.NewMemoryStore()
 		contract := chaincode.NewAccountabilityContract(store)
+		tamperedVal := new(big.Int).Add(dkgResult.Shares[2].Value, big.NewInt(42))
+		tamperedVal.Mod(tamperedVal, params.Curve.Params().N)
+		commHex := make([][2]string, len(dkgResult.Commitments))
+		for ci, c := range dkgResult.Commitments {
+			commHex[ci] = [2]string{hex.EncodeToString(c.X.Bytes()), hex.EncodeToString(c.Y.Bytes())}
+		}
 		evidence := chaincode.EvidencePackage{
 			EvidenceID: fmt.Sprintf("ev-%d", i), Type: chaincode.M1InvalidSignature,
 			AccusedPeer: "P_3",
-			Evidence:    chaincode.CryptoEvidence{VerificationResult: false},
+			Evidence: chaincode.CryptoEvidence{
+				ShareValueHex:       hex.EncodeToString(tamperedVal.Bytes()),
+				CommitmentPointsHex: commHex,
+				Message:             "jwt-signing-input",
+				PeerIndex:           3,
+			},
 			Witnesses: []chaincode.Witness{
 				{PeerID: "P_1", Signature: "s1"},
 				{PeerID: "P_2", Signature: "s2"},
@@ -265,6 +318,9 @@ func TestBenchmark_Throughput(t *testing.T) {
 	for _, cfg := range configs {
 		params := dkg.Params{T: cfg.t, N: cfg.n, Curve: elliptic.P256()}
 		dkgResult, _ := dkg.SimulateDKG(params)
+
+		// Warm-up
+		runWarmUp(func() { signing.ThresholdSign(dkgResult, cfg.signers, payload) })
 
 		count := 1000
 		start := time.Now()
